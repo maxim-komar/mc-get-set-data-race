@@ -1,0 +1,233 @@
+#!/usr/bin/env perl
+use warnings;
+use strict;
+
+use feature qw( state );
+
+use Cache::Memcached::Fast;
+use English qw( -no_match_vars );
+use Getopt::Long;
+use Params::Validate qw( :all );
+
+my $host;
+my $port;
+my $key;
+my $iter;
+my $method;
+
+Getopt::Long::GetOptions(
+    q{host=s}   => \$host,
+    q{port=s}   => \$port,
+    q{iter=s}   => \$iter,
+    q{key=s}    => \$key,
+    q{method=s} => \$method,
+);
+
+my %method = (
+    atomic    => \&atomicGetApplySet,
+    nonatomic => \&nonatomicGetApplySet,
+);
+
+if ( 
+       ( not $host   )
+    || ( not $port   )
+    || ( not $key    )
+    || ( not $iter   )
+    || ( not $method )
+    || ( not exists $method{ $method } )
+)
+{
+    usage();
+}
+
+sub usage
+{
+    my $supported_methods = join q{|}, sort keys %method;
+    printf qq{Usage: %s --host=... --port=... --key=... --iter=... --method=%s\n},
+        $PROGRAM_NAME,
+        $supported_methods;
+    exit 1;
+}
+
+###
+my $conn_ref = Cache::Memcached::Fast->new({
+    servers => [ { address => sprintf( q{%s:%d}, $host, $port ) } ],
+});
+
+$conn_ref->delete( $key );
+
+my $concurrency = 2;
+runConcurrent(
+    concurrency => $concurrency,
+    method      => $method{ $method },
+    host        => $host,
+    port        => $port,
+    key         => $key,
+    iter        => $iter,
+    next        => \&nextStr,
+);
+
+my $expected;
+for ( my $i = 0; $i < $concurrency * $iter; $i++ )
+{
+    $expected = nextStr( $expected );
+}
+
+my $actual = $conn_ref->get( $key );
+
+printf qq{expected: %s, actual: %s\n}, $expected, $actual;
+
+###
+sub repeat
+{
+    state $spec_href = {
+        host   => { type => SCALAR  },
+        port   => { type => SCALAR  },
+        key    => { type => SCALAR  },
+        next   => { type => CODEREF },
+        iter   => { type => SCALAR  },
+        method => { type => CODEREF },
+    };
+    my %arg = validate( @_, $spec_href );
+
+    my $conn_ref = Cache::Memcached::Fast->new({
+        servers => [ { address => sprintf( q{%s:%d}, $arg{host}, $arg{port} ) } ],
+    });
+
+    foreach ( 1 .. $arg{iter} )
+    {
+        my ( $ok, $new_value ) = $arg{method}->(
+            conn => $conn_ref,
+            key  => $arg{key},
+            next => $arg{next},
+        );
+    }
+}
+
+sub nextStr
+{
+    my ( $old_value ) = @_;
+
+    if ( not defined $old_value )
+    {
+        return 0;
+    }
+    elsif ( $old_value % 2 == 0 )
+    {
+        return $old_value + 3;
+    }
+    else
+    {
+        return $old_value + 1;
+    }
+};
+
+sub nonatomicGetApplySet
+{
+    state $spec_href = {
+        conn => { type => OBJECT  },
+        key  => { type => SCALAR  },
+        next => { type => CODEREF },
+    };
+    my %arg = validate( @_, $spec_href );
+
+    my $old_value = $arg{conn}->get( $arg{key} );
+    my $new_value = $arg{next}->( $old_value );
+    $arg{conn}->set(
+        $arg{key},
+        $new_value,
+    );
+}
+
+sub atomicGetApplySet
+{
+    state $spec_href = {
+        conn => { type => OBJECT  },
+        key  => { type => SCALAR  },
+        next => { type => CODEREF },
+    };
+    my %arg = validate( @_, $spec_href );
+
+    while ( 1 )
+    {
+        # Return: reference to an array [$cas, $value], or nothing.
+        my $cas_and_value_aref = $arg{conn}->gets( $arg{key} ); 
+        if ( not $cas_and_value_aref )
+        {
+            my $init_value = $arg{next}->();
+            # Return: boolean, true for positive server reply, false for negative server reply, or undef in case of some error.
+            my $ret = $arg{conn}->add(
+                $arg{key},
+                $init_value,
+            );
+            if ( $ret )
+            {
+                return $init_value;
+            }
+        }
+        else
+        {
+            my ( $cas, $old_value ) = @{ $cas_and_value_aref };
+
+            my $new_value = $arg{next}->( $old_value );
+            # Return: boolean, true for positive server reply, false for negative server reply, or undef in case of some error. 
+            my $ret = $arg{conn}->cas(
+                $arg{key},
+                $cas,
+                $new_value,
+            );
+            if ( $ret )
+            {
+                return $new_value;
+            }
+        }
+    }
+}
+
+sub runConcurrent
+{
+    state $spec_href = {
+        concurrency => { type => SCALAR  },
+        method      => { type => CODEREF },
+        host        => { type => SCALAR  },
+        port        => { type => SCALAR  },
+        key         => { type => SCALAR  },
+        iter        => { type => SCALAR  },
+        next        => { type => CODEREF },
+    };
+    my %arg = validate( @_, $spec_href );
+
+    for ( my $i = 0; $i < $arg{concurrency}; $i++ )
+    {
+        go( \&repeat, [
+            host   => $arg{host},
+            port   => $arg{port},
+            next   => $arg{next},
+            key    => $arg{key},
+            iter   => $arg{iter},
+            method => $arg{method},
+        ] );
+    }
+    waitAll();
+}
+
+sub go
+{
+    my ( $func_cref, $args_aref ) = @_;
+
+    my $pid = fork;
+    if ( not defined $pid )
+    {
+        exit 2;
+    }
+    elsif ( not $pid )
+    {
+        $func_cref->( @{ $args_aref } );
+        exit;
+    }
+}
+
+sub waitAll
+{
+    while ( wait() != -1 ) {}
+}
